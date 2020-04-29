@@ -4,7 +4,7 @@ import weakref
 from sqlalchemy import util
 
 # noinspection PyProtectedMember
-from ..engine import _SAConnection, _SAEngine, _DBAPIConnection
+from ..engine import _SAConnection, _SAEngine, _DBAPIConnection, _bypass_no_param
 from ..loader import Loader
 
 DEFAULT = object()
@@ -35,6 +35,9 @@ class DBAPICursor:
         raise NotImplementedError
 
     async def async_execute(self, query, timeout, args, limit=0, many=False):
+        raise NotImplementedError
+
+    async def execute_baked(self, baked_query, timeout, args, one):
         raise NotImplementedError
 
     def get_statusmsg(self):
@@ -211,9 +214,14 @@ class _ResultProxy:
             )
         else:
             args = param_groups[0]
-            rows = await cursor.async_execute(
-                context.statement, context.timeout, args, 1 if one else 0
-            )
+            if context.baked_query:
+                rows = await cursor.execute_baked(
+                    context.baked_query, context.timeout, args, one
+                )
+            else:
+                rows = await cursor.async_execute(
+                    context.statement, context.timeout, args, 1 if one else 0
+                )
             item = context.process_rows(rows, return_model=return_model)
             if one:
                 if item:
@@ -248,6 +256,8 @@ class Cursor:
 
 
 class ExecutionContextOverride:
+    baked_query = False
+
     def _compiled_first_opt(self, key, default=DEFAULT):
         rv = DEFAULT
         opts = getattr(getattr(self, "compiled", None), "execution_options", None)
@@ -386,10 +396,19 @@ class ExecutionContextOverride:
         self.cursor = self.create_cursor()
         return self
 
+    @classmethod
+    def _init_baked_query(cls, dialect, connection, dbapi_connection, bq, parameters):
+        self = cls._init_compiled(
+            dialect, connection, dbapi_connection, bq.compiled_sql, parameters
+        )
+        self.baked_query = bq
+        return self
+
 
 class AsyncDialectMixin:
     cursor_cls = DBAPICursor
     dbapi_class = BaseDBAPI
+    _bakery = None
 
     def _init_mixin(self):
         self._sa_conn = _SAConnection(
@@ -400,8 +419,12 @@ class AsyncDialectMixin:
     def dbapi(cls):
         return cls.dbapi_class
 
-    def compile(self, elem, *multiparams, **params):
-        context = self._sa_conn.execute(elem, *multiparams, **params).context
+    def compile(self, elem, *multiparams, compiled_cache=None, **params):
+        if compiled_cache is None:
+            conn = self._sa_conn
+        else:
+            conn = self._sa_conn.execution_options(compiled_cache=compiled_cache)
+        context = conn.execute(elem, *multiparams, **params).context
         if context.executemany:
             return context.statement, context.parameters
         else:
@@ -412,3 +435,12 @@ class AsyncDialectMixin:
 
     def transaction(self, raw_conn, args, kwargs):
         raise NotImplementedError
+
+    def set_bakery(self, bakery):
+        self._bakery = bakery
+        for bq in bakery:
+            conn = self._sa_conn.execution_options(
+                compiled_cache=bq)
+            context = conn.execute(bq.elem, _bypass_no_param).context
+            # noinspection PyProtectedMember
+            bq._set_sql(context.statement)
